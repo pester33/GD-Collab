@@ -1,3 +1,8 @@
+# v1.2.0
+- Color channels sync (BG, Ground, Line, 1-999, copy color, blending, opacity)
+- People joining later get the room's colors too
+- Groups sync with the objects (Edit Group changes are sent like any other edit)
+
 # v1.1.1
 - Fixed edits not syncing at all (it kept sending empty updates and never sent your blocks)
 - Changes that fail to send are now sent again

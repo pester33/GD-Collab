@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <deque>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -82,6 +83,37 @@ static ccColor3B colorForClient(std::string const& client) {
     uint32_t h = 2166136261u;
     for (unsigned char c : client) { h ^= c; h *= 16777619u; }
     return palette[h % (sizeof(palette) / sizeof(palette[0]))];
+}
+
+// ----- Color channels (BG, Ground, 1-999...) live in the level settings string under kS38
+// kS38 looks like "1_255_2_0_3_0_6_1000_7_1|1_0_2_102_3_255_6_1001_7_1|..."
+static std::string levelColorString(LevelEditorLayer* editor) {
+    if (!editor->m_levelSettings) return "";
+    std::string header = editor->m_levelSettings->getSaveString();
+    auto start = header.find("kS38,");
+    if (start == std::string::npos) return "";
+    start += 5;
+    auto end = header.find(',', start);
+    return header.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+static int colorEntryChannel(std::string const& entry) {
+    // pairs of key_value: channel id is key 6
+    auto parts = utils::string::split(entry, "_");
+    for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+        if (parts[i] == "6") return utils::numFromString<int>(parts[i + 1]).unwrapOr(0);
+    }
+    return 0;
+}
+
+static std::map<int, std::string> splitColors(std::string const& str) {
+    std::map<int, std::string> out;
+    for (auto& entry : utils::string::split(str, "|")) {
+        if (entry.empty()) continue;
+        int id = colorEntryChannel(entry);
+        if (id > 0) out[id] = entry;
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,14 +229,23 @@ public:
             m_lastEvent = json[0]["snapshot_event"].asInt().unwrapOr(0);
             this->clearLevel(editor);
             std::vector<std::pair<std::string, std::string>> objects;
+            std::vector<std::string> colorEntries;
             if (snapshot.isArray()) {
                 for (auto& pair : snapshot) {
                     if (pair.isArray() && pair.size() == 2) {
-                        objects.push_back({ pair[0].asString().unwrapOr(""), pair[1].asString().unwrapOr("") });
+                        auto uuid = pair[0].asString().unwrapOr("");
+                        auto str = pair[1].asString().unwrapOr("");
+                        if (uuid == "#colors") {
+                            for (auto& [id, entry] : splitColors(str)) colorEntries.push_back(entry);
+                        } else {
+                            objects.push_back({ uuid, str });
+                        }
                     }
                 }
             }
             this->createObjects(editor, objects);
+            this->applyColors(editor, colorEntries);
+            m_colors = splitColors(levelColorString(editor)); // starting point: nothing to send yet
             room = code;
             isHost = false;
             active = true;
@@ -266,6 +307,7 @@ private:
     std::unordered_map<GameObject*, Tracked> m_tracked;
     std::unordered_map<std::string, GameObject*> m_byUuid;
     std::unordered_map<std::string, int64_t> m_ownLatest; // uuid -> id of our newest event touching it
+    std::map<int, std::string> m_colors; // color channel -> its settings the last time we looked
     async::TaskHolder<web::WebResponse> m_tasks;
     async::TaskHolder<web::WebResponse> m_pushTask;
     async::TaskHolder<web::WebResponse> m_pollTask;
@@ -287,6 +329,7 @@ private:
         m_tracked.clear();
         m_byUuid.clear();
         m_ownLatest.clear();
+        m_colors.clear();
         m_lastEvent = 0;
         m_maxOwnEvent = 0;
         m_ticks = 0;
@@ -338,6 +381,13 @@ private:
                 ++it;
             }
         }
+        auto colors = splitColors(levelColorString(editor));
+        for (auto& [id, entry] : colors) {
+            auto it = m_colors.find(id);
+            if (it != m_colors.end() && it->second == entry) continue;
+            m_colors[id] = entry;
+            if (!silent) ops.push_back(matjson::makeObject({ { "o", "c" }, { "u", fmt::format("#c{}", id) }, { "s", entry } }));
+        }
         return matjson::Value(ops); // empty array = no changes
     }
 
@@ -345,6 +395,9 @@ private:
         std::vector<matjson::Value> list;
         list.reserve(m_tracked.size());
         for (auto& [obj, t] : m_tracked) list.push_back(matjson::Value(std::vector<matjson::Value>{ t.uuid, t.str }));
+        if (auto editor = m_editor.lock()) {
+            list.push_back(matjson::Value(std::vector<matjson::Value>{ "#colors", levelColorString(editor) }));
+        }
         return matjson::Value(list).dump(matjson::NO_INDENTATION);
     }
 
@@ -420,6 +473,7 @@ private:
     int applyOps(LevelEditorLayer* editor, matjson::Value const& ops, int64_t eventId, std::string const& author, std::string const& client) {
         std::vector<std::pair<std::string, std::string>> toCreate;
         std::vector<CCRect> rects;
+        std::vector<std::string> colorEntries;
         int count = 0, placed = 0, edited = 0, deleted = 0;
         for (auto& op : ops) {
             auto kind = op["o"].asString().unwrapOr("");
@@ -428,6 +482,11 @@ private:
             auto own = m_ownLatest.find(uuid);
             if (own != m_ownLatest.end() && own->second > eventId) continue;
 
+            if (kind == "c") {
+                colorEntries.push_back(op["s"].asString().unwrapOr(""));
+                count++;
+                continue;
+            }
             if (auto existing = m_byUuid.find(uuid); existing != m_byUuid.end()) {
                 if (kind == "d") rects.push_back(existing->second->getObjectRect());
                 this->removeTracked(editor, existing->second);
@@ -439,6 +498,7 @@ private:
             count++;
         }
         this->createObjects(editor, toCreate);
+        this->applyColors(editor, colorEntries);
         if (count == 0) return 0;
 
         for (auto& [uuid, str] : toCreate) {
@@ -465,9 +525,39 @@ private:
         add(placed, "placed");
         add(edited, "edited");
         add(deleted, "deleted");
+        if (!colorEntries.empty()) {
+            what += fmt::format("{}changed {} color{}", what.empty() ? "" : ", ", colorEntries.size(), colorEntries.size() == 1 ? "" : "s");
+        }
         feed.push_back({ fmt::format("{} {}", author, what), color, 0.f });
         while (feed.size() > 4) feed.pop_front();
         return count;
+    }
+
+    // Sets color channels from their saved form (same format GD saves levels in)
+    void applyColors(LevelEditorLayer* editor, std::vector<std::string> const& entries) {
+        if (entries.empty() || !editor->m_levelSettings || !editor->m_levelSettings->m_effectManager) return;
+        auto settingsColors = editor->m_levelSettings->m_effectManager;
+        for (auto& entry : entries) {
+            int id = colorEntryChannel(entry);
+            if (id <= 0) continue;
+            auto action = settingsColors->getColorAction(id);
+            if (!action) continue;
+            action->setupFromString(entry);
+            action->m_color = action->m_fromColor;
+            action->m_currentOpacity = action->m_fromOpacity;
+        }
+        // copy the level's colors into the live editor so they show right away
+        if (editor->m_effectManager) {
+            editor->transferDefaultColors(settingsColors, editor->m_effectManager);
+            editor->m_effectManager->calculateBaseActiveColors();
+            editor->m_effectManager->processInheritedColors();
+        }
+        // remember how GD saves them now, so we don't send them straight back
+        auto now = splitColors(levelColorString(editor));
+        for (auto& entry : entries) {
+            int id = colorEntryChannel(entry);
+            if (auto it = now.find(id); it != now.end()) m_colors[id] = it->second;
+        }
     }
 
     void removeTracked(LevelEditorLayer* editor, GameObject* obj) {
