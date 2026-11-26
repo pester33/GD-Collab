@@ -76,6 +76,7 @@ static std::string isoNow(int64_t offsetSecs = 0) {
 struct Tracked {
     std::string uuid;
     std::string str; // object's save string the last time we looked
+    Ref<GameObject> keep; // keeps the object alive until we notice it's gone
 };
 
 class CollabSession {
@@ -259,7 +260,7 @@ private:
                 auto it = m_tracked.find(obj);
                 if (it == m_tracked.end()) {
                     auto uuid = this->newUuid();
-                    m_tracked[obj] = { uuid, str };
+                    m_tracked[obj] = { uuid, str, obj };
                     m_byUuid[uuid] = obj;
                     if (!silent) ops.push_back(matjson::makeObject({ { "o", "a" }, { "u", uuid }, { "s", str } }));
                 } else if (it->second.str != str) {
@@ -376,34 +377,59 @@ private:
     }
 
     void removeTracked(LevelEditorLayer* editor, GameObject* obj) {
+        Ref<GameObject> hold = obj; // stay valid while we remove it
         if (auto it = m_tracked.find(obj); it != m_tracked.end()) {
             m_byUuid.erase(it->second.uuid);
             m_tracked.erase(it);
         }
+        // the player may have deleted it already
+        if (!obj->getParent()) return;
         if (obj->m_isSelected && editor->m_editorUI) editor->m_editorUI->deselectObject(obj);
         editor->removeObject(obj, true);
     }
 
+    void track(LevelEditorLayer* editor, GameObject* obj, std::string const& uuid) {
+        m_tracked[obj] = { uuid, saveString(editor, obj), obj };
+        m_byUuid[uuid] = obj;
+    }
+
     void createObjects(LevelEditorLayer* editor, std::vector<std::pair<std::string, std::string>> const& objects) {
-        for (auto& [uuid, str] : objects) {
-            if (str.empty()) continue;
+        std::vector<std::pair<std::string, std::string>> list;
+        for (auto& o : objects) if (!o.second.empty()) list.push_back(o);
+        if (list.empty()) return;
+
+        // Fast path: create everything in one go (big levels would freeze the game otherwise)
+        if (list.size() > 1) {
+            std::string all;
+            for (auto& [uuid, str] : list) {
+                all += str;
+                if (!str.empty() && str.back() != ';') all += ';';
+            }
+            auto created = editor->createObjectsFromString(all, true, true);
+            if (created && created->count() == list.size()) {
+                for (size_t i = 0; i < list.size(); i++) {
+                    this->track(editor, static_cast<GameObject*>(created->objectAtIndex(i)), list[i].first);
+                }
+                return;
+            }
+            // counts didn't line up: undo and fall back to one by one
+            log::warn("[collab] Batch create made {} of {} objects, creating one by one", created ? created->count() : 0, list.size());
+            if (created) {
+                for (auto obj : CCArrayExt<GameObject*>(created)) editor->removeObject(obj, true);
+            }
+        }
+        for (auto& [uuid, str] : list) {
             auto created = editor->createObjectsFromString(str, true, true);
             if (!created || created->count() == 0) continue;
-            auto obj = static_cast<GameObject*>(created->objectAtIndex(0));
-            auto actual = saveString(editor, obj);
-            m_tracked[obj] = { uuid, actual };
-            m_byUuid[uuid] = obj;
+            this->track(editor, static_cast<GameObject*>(created->objectAtIndex(0)), uuid);
         }
     }
 
     void clearLevel(LevelEditorLayer* editor) {
-        if (editor->m_editorUI) editor->m_editorUI->deselectAll();
-        if (!editor->m_objects) return;
-        std::vector<Ref<GameObject>> all;
-        for (auto obj : CCArrayExt<GameObject*>(editor->m_objects)) all.push_back(obj);
-        for (auto& obj : all) editor->removeObject(obj, true);
         m_tracked.clear();
         m_byUuid.clear();
+        // GD's own "delete everything": fast, and also clears undo/redo so nothing points at deleted objects
+        editor->removeAllObjects();
     }
 
     void ping() {
