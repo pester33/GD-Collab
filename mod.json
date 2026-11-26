@@ -6,10 +6,13 @@
 	},
 	"id": "pester.gd-collab",
 	"name": "GD Collab",
-	"version": "v1.0.0",
+	"version": "v1.0.1",
 	"developer": "Pester",
 	"description": "Build levels together live: host a room in the editor, friends join with the code, and everyone's edits sync.",
-	"tags": ["editor", "online"],
+	"tags": [
+		"editor",
+		"online"
+	],
 	"settings": {
 		"sync-interval": {
 			"type": "float",
@@ -18,7 +21,10 @@
 			"default": 1.0,
 			"min": 0.5,
 			"max": 5.0,
-			"control": { "slider": true, "slider-step": 0.5 }
+			"control": {
+				"slider": true,
+				"slider-step": 0.5
+			}
 		},
 		"check-updates": {
 			"type": "bool",

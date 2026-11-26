@@ -689,7 +689,8 @@ class $modify(CollabPauseLayer, EditorPauseLayer) {
         auto menu = CCMenu::create();
         menu->setID("collab-menu"_spr);
         menu->setPosition({ 0.f, 0.f });
-        btn->setPosition({ winSize.width - 52.f, winSize.height - 30.f });
+        // left of the Settings / Export column, so it doesn't cover GD's buttons
+        btn->setPosition({ winSize.width - 112.f, winSize.height - 52.f });
         menu->addChild(btn);
         this->addChild(menu, 100);
     }
