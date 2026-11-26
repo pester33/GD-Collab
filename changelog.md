@@ -1,3 +1,7 @@
+# v1.2.1
+- Renamed to GD Gaming Collab
+- New logo
+
 # v1.2.0
 - Color channels sync (BG, Ground, Line, 1-999, copy color, blending, opacity)
 - People joining later get the room's colors too

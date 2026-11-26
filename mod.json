@@ -5,8 +5,8 @@
 		"android": "2.2091"
 	},
 	"id": "pester.gd-collab",
-	"name": "GD Collab",
-	"version": "v1.2.0",
+	"name": "GD Gaming Collab",
+	"version": "v1.2.1",
 	"developer": "Pester",
 	"description": "Build levels together live: host a room in the editor, friends join with the code, and everyone's edits sync.",
 	"tags": [

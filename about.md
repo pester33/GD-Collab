@@ -1,4 +1,4 @@
-# GD Collab
+# GD Gaming Collab
 
 Build a level **together, live**.
 

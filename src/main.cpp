@@ -1338,7 +1338,7 @@ static void installUpdate(std::string version) {
     if (s_updateBusy) return;
     s_updateBusy = true;
     auto url = fmt::format("{}{}.geode", RELEASE_BASE, Mod::get()->getID());
-    auto loading = Notification::create("Downloading GD Collab update...", NotificationIcon::Loading, 0.f);
+    auto loading = Notification::create("Downloading GD Gaming Collab update...", NotificationIcon::Loading, 0.f);
     loading->show();
     web::WebRequest req;
     setTimeout(req, 90);
@@ -1355,7 +1355,7 @@ static void installUpdate(std::string version) {
             return;
         }
         whenScreenReady([version] {
-            createQuickPopup("Update installed", fmt::format("GD Collab <cg>{}</c> is installed.\nRestart GD to use it.", version),
+            createQuickPopup("Update installed", fmt::format("GD Gaming Collab <cg>{}</c> is installed.\nRestart GD to use it.", version),
                 "Later", "Restart", [](auto, bool restart) { if (restart) game::restart(true); });
         });
     });
@@ -1380,7 +1380,7 @@ static void checkForUpdate(bool isRetry = false) {
         if (!(latest.unwrap() > current)) return;
         auto version = latest.unwrap().toVString();
         whenScreenReady([version, current] {
-            createQuickPopup("GD Collab",
+            createQuickPopup("GD Gaming Collab",
                 fmt::format("A new version is out: <cg>{}</c> (you have {}).\nUpdate now?", version, current.toVString()),
                 "Later", "Update", [version](auto, bool update) { if (update) installUpdate(version); });
         });

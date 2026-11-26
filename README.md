@@ -1,4 +1,4 @@
-# GD Collab (Geode mod)
+# GD Gaming Collab (Geode mod)
 
 Live collab editing for Geometry Dash: host a room in the editor, friends join with the code, and everyone's edits sync.
 
