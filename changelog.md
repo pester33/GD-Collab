@@ -1,3 +1,7 @@
+# v1.1.1
+- Fixed edits not syncing at all (it kept sending empty updates and never sent your blocks)
+- Changes that fail to send are now sent again
+
 # v1.1.0
 - Collab button in My Levels: join a room with a code, or start a new collab level
 - See everyone's cursor and name live in the editor

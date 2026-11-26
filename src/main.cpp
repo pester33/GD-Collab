@@ -234,7 +234,14 @@ public:
         // 1) send our own edits (one batch at a time)
         if (!m_pushing) {
             auto ops = this->scanLocal(editor, false);
-            if (!ops.isNull()) this->push(std::move(ops));
+            if (m_retry.size() > 0) {
+                // a send failed earlier: send those changes again, plus the new ones
+                auto all = std::move(m_retry);
+                m_retry = matjson::Value(std::vector<matjson::Value>{});
+                for (auto& op : ops) all.push(op);
+                ops = std::move(all);
+            }
+            if (ops.size() > 0) this->push(std::move(ops));
         }
         // 2) pull in everyone else's edits (not while our own batch is on its way,
         //    so the newest change always wins the same way for everyone)
@@ -285,6 +292,7 @@ private:
         m_ticks = 0;
         m_pushing = false;
         m_polling = false;
+        m_retry = matjson::Value(std::vector<matjson::Value>{});
         m_tasks.cancel();
         m_pushTask.cancel();
         m_pollTask.cancel();
@@ -330,7 +338,7 @@ private:
                 ++it;
             }
         }
-        return ops.empty() ? matjson::Value() : matjson::Value(ops);
+        return matjson::Value(ops); // empty array = no changes
     }
 
     std::string snapshotJson() {
@@ -368,14 +376,14 @@ private:
             for (auto& u : uuids) m_ownLatest[u] = id;
             m_maxOwnEvent = std::max(m_maxOwnEvent, id);
             status = fmt::format("Sent {} change{}", count, count == 1 ? "" : "s");
-            if (!m_retry.isNull()) {
+            if (m_retry.size() > 0) {
                 auto retry = std::move(m_retry);
-                m_retry = matjson::Value();
+                m_retry = matjson::Value(std::vector<matjson::Value>{});
                 this->push(std::move(retry));
             }
         });
     }
-    matjson::Value m_retry;
+    matjson::Value m_retry = matjson::Value(std::vector<matjson::Value>{}); // note: matjson::Value() is an empty OBJECT, not null
 
     void poll() {
         m_polling = true;
@@ -573,7 +581,7 @@ private:
     void saveSnapshot(LevelEditorLayer* editor) {
         // make sure everything we have is already sent and tracked
         auto ops = this->scanLocal(editor, false);
-        if (!ops.isNull()) return this->push(std::move(ops)); // try again next time
+        if (ops.size() > 0) return this->push(std::move(ops)); // try again next time
         auto body = matjson::makeObject({
             { "snapshot", this->snapshotJson() },
             { "snapshot_event", std::max(m_lastEvent, m_maxOwnEvent) },
