@@ -2,12 +2,16 @@
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/EditorPauseLayer.hpp>
 #include <Geode/modify/MenuLayer.hpp>
+#include <Geode/modify/LevelBrowserLayer.hpp>
+#include <Geode/modify/EditorUI.hpp>
 #include <Geode/ui/TextInput.hpp>
+#include <Geode/ui/BasedButtonSprite.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/random.hpp>
 
 #include <chrono>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -69,6 +73,17 @@ static std::string isoNow(int64_t offsetSecs = 0) {
     return fmt::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, rem / 3600, (rem / 60) % 60, rem % 60);
 }
 
+// Every player gets their own color, picked from their client id
+static ccColor3B colorForClient(std::string const& client) {
+    static constexpr ccColor3B palette[] = {
+        { 255, 95, 95 }, { 90, 200, 255 }, { 120, 255, 120 }, { 255, 205, 60 },
+        { 215, 125, 255 }, { 255, 145, 205 }, { 80, 255, 220 }, { 255, 160, 80 },
+    };
+    uint32_t h = 2166136261u;
+    for (unsigned char c : client) { h ^= c; h *= 16777619u; }
+    return palette[h % (sizeof(palette) / sizeof(palette[0]))];
+}
+
 // ---------------------------------------------------------------------------
 // The collab session: tracks every object with a shared id and syncs changes
 // ---------------------------------------------------------------------------
@@ -91,6 +106,36 @@ public:
     std::string room;
     std::string status = "Not in a room";
     std::vector<std::string> members;
+
+    // Other players in the room, with their cursor (in level coordinates)
+    struct Member {
+        std::string client;
+        std::string name;
+        float x = 0.f, y = 0.f;
+        bool hasCursor = false;
+        ccColor3B color;
+    };
+    std::vector<Member> others;
+
+    // Objects someone else just changed, waiting to be flashed in the editor
+    struct Highlight {
+        std::vector<CCRect> rects;
+        std::string name;
+        ccColor3B color;
+    };
+    std::vector<Highlight> highlights;
+
+    // "Pester placed 3, deleted 1"
+    struct FeedLine {
+        std::string text;
+        ccColor3B color;
+        float age = 0.f;
+    };
+    std::deque<FeedLine> feed;
+
+    // Our own cursor, sent with every ping
+    CCPoint cursor = { 0.f, 0.f };
+    bool hasCursor = false;
 
     bool isActiveFor(LevelEditorLayer* editor) const {
         return active && m_editor.lock().data() == editor;
@@ -194,8 +239,8 @@ public:
         // 2) pull in everyone else's edits (not while our own batch is on its way,
         //    so the newest change always wins the same way for everyone)
         if (!m_pushing && !m_polling) this->poll();
-        // 3) who's here
-        if (m_ticks % 4 == 1) this->ping();
+        // 3) who's here, and where everyone's cursor is
+        if (!m_pinging) this->ping();
         // 4) the host keeps the room's saved copy fresh for people who join later
         if (isHost && m_ticks % 90 == 0 && !m_pushing) this->saveSnapshot(editor);
     }
@@ -209,6 +254,8 @@ private:
     int m_ticks = 0;
     bool m_pushing = false;
     bool m_polling = false;
+    bool m_pinging = false;
+    bool m_cursorColumns = true; // false if the database wasn't updated for cursors yet
     std::unordered_map<GameObject*, Tracked> m_tracked;
     std::unordered_map<std::string, GameObject*> m_byUuid;
     std::unordered_map<std::string, int64_t> m_ownLatest; // uuid -> id of our newest event touching it
@@ -223,6 +270,11 @@ private:
         isHost = false;
         room.clear();
         members.clear();
+        others.clear();
+        highlights.clear();
+        feed.clear();
+        hasCursor = false;
+        m_pinging = false;
         status = "Not in a room";
         m_editor = nullptr;
         m_tracked.clear();
@@ -328,7 +380,7 @@ private:
     void poll() {
         m_polling = true;
         auto url = fmt::format(
-            "{}/rest/v1/collab_events?room=eq.{}&id=gt.{}&client=neq.{}&select=id,author,data&order=id.asc&limit=200",
+            "{}/rest/v1/collab_events?room=eq.{}&id=gt.{}&client=neq.{}&select=id,client,author,data&order=id.asc&limit=200",
             SUPA_URL, room, m_lastEvent, m_client
         );
         m_pollTask.spawn(supa().get(url), [this](web::WebResponse res) {
@@ -347,18 +399,20 @@ private:
             for (auto& ev : json) {
                 int64_t id = ev["id"].asInt().unwrapOr(0);
                 auto ops = matjson::parse(ev["data"].asString().unwrapOr("[]")).unwrapOr(matjson::Value());
-                if (ops.isArray()) applied += this->applyOps(editor, ops, id);
+                lastAuthor = ev["author"].asString().unwrapOr("Someone");
+                auto client = ev["client"].asString().unwrapOr("");
+                if (ops.isArray()) applied += this->applyOps(editor, ops, id, lastAuthor, client);
                 m_lastEvent = std::max(m_lastEvent, id);
-                lastAuthor = ev["author"].asString().unwrapOr("");
             }
             if (applied > 0) status = fmt::format("{} edited {} object{}", lastAuthor, applied, applied == 1 ? "" : "s");
         });
     }
 
     // Applies someone else's changes. Newest event wins: skip anything we changed more recently.
-    int applyOps(LevelEditorLayer* editor, matjson::Value const& ops, int64_t eventId) {
+    int applyOps(LevelEditorLayer* editor, matjson::Value const& ops, int64_t eventId, std::string const& author, std::string const& client) {
         std::vector<std::pair<std::string, std::string>> toCreate;
-        int count = 0;
+        std::vector<CCRect> rects;
+        int count = 0, placed = 0, edited = 0, deleted = 0;
         for (auto& op : ops) {
             auto kind = op["o"].asString().unwrapOr("");
             auto uuid = op["u"].asString().unwrapOr("");
@@ -367,12 +421,44 @@ private:
             if (own != m_ownLatest.end() && own->second > eventId) continue;
 
             if (auto existing = m_byUuid.find(uuid); existing != m_byUuid.end()) {
+                if (kind == "d") rects.push_back(existing->second->getObjectRect());
                 this->removeTracked(editor, existing->second);
             }
             if (kind == "a" || kind == "m") toCreate.push_back({ uuid, op["s"].asString().unwrapOr("") });
+            if (kind == "a") placed++;
+            else if (kind == "m") edited++;
+            else if (kind == "d") deleted++;
             count++;
         }
         this->createObjects(editor, toCreate);
+        if (count == 0) return 0;
+
+        for (auto& [uuid, str] : toCreate) {
+            if (auto it = m_byUuid.find(uuid); it != m_byUuid.end()) rects.push_back(it->second->getObjectRect());
+        }
+        auto color = colorForClient(client);
+        if (!rects.empty()) {
+            if (rects.size() > 40) {
+                // lots of objects: one box around all of them
+                float x0 = rects[0].getMinX(), y0 = rects[0].getMinY(), x1 = rects[0].getMaxX(), y1 = rects[0].getMaxY();
+                for (auto& r : rects) {
+                    x0 = std::min(x0, r.getMinX()); y0 = std::min(y0, r.getMinY());
+                    x1 = std::max(x1, r.getMaxX()); y1 = std::max(y1, r.getMaxY());
+                }
+                rects = { CCRect(x0, y0, x1 - x0, y1 - y0) };
+            }
+            highlights.push_back({ std::move(rects), author, color });
+            if (highlights.size() > 20) highlights.erase(highlights.begin());
+        }
+        std::string what;
+        auto add = [&](int n, char const* verb) {
+            if (n > 0) what += fmt::format("{}{} {}", what.empty() ? "" : ", ", verb, n);
+        };
+        add(placed, "placed");
+        add(edited, "edited");
+        add(deleted, "deleted");
+        feed.push_back({ fmt::format("{} {}", author, what), color, 0.f });
+        while (feed.size() > 4) feed.pop_front();
         return count;
     }
 
@@ -433,22 +519,53 @@ private:
     }
 
     void ping() {
+        m_pinging = true;
         auto body = matjson::makeObject({
             { "room", room }, { "client", m_client }, { "name", playerName() }, { "last_seen", isoNow() },
         });
+        if (m_cursorColumns) {
+            body.set("cursor_x", std::round(cursor.x * 10.f) / 10.f);
+            body.set("cursor_y", std::round(cursor.y * 10.f) / 10.f);
+            body.set("has_cursor", hasCursor);
+        }
         auto req = supa();
         req.header("Prefer", "resolution=merge-duplicates,return=minimal");
         req.bodyJSON(body);
         auto roomCode = room;
-        m_pingTask.spawn(req.post(fmt::format("{}/rest/v1/collab_members?on_conflict=room,client", SUPA_URL)), [this, roomCode](web::WebResponse) {
-            if (!active || room != roomCode) return;
-            auto url = fmt::format("{}/rest/v1/collab_members?room=eq.{}&last_seen=gt.{}&select=name&order=name.asc", SUPA_URL, roomCode, isoNow(-25));
+        m_pingTask.spawn(req.post(fmt::format("{}/rest/v1/collab_members?on_conflict=room,client", SUPA_URL)), [this, roomCode](web::WebResponse res) {
+            if (!active || room != roomCode) { m_pinging = false; return; }
+            if (!res.ok() && m_cursorColumns && res.string().unwrapOr("").find("cursor") != std::string::npos) {
+                // the cursor columns don't exist: keep working without cursors
+                log::warn("[collab] Database has no cursor columns yet, run sql/update-cursors.sql");
+                m_cursorColumns = false;
+                m_pinging = false;
+                return;
+            }
+            auto url = fmt::format(
+                "{}/rest/v1/collab_members?room=eq.{}&last_seen=gt.{}&select={}&order=name.asc",
+                SUPA_URL, roomCode, isoNow(-20), m_cursorColumns ? "client,name,cursor_x,cursor_y,has_cursor" : "client,name"
+            );
             m_pingTask.spawn(supa().get(url), [this, roomCode](web::WebResponse res) {
+                m_pinging = false;
                 if (!active || room != roomCode || !res.ok()) return;
                 auto json = res.json().unwrapOr(matjson::Value());
                 if (!json.isArray()) return;
                 members.clear();
-                for (auto& m : json) members.push_back(m["name"].asString().unwrapOr("?"));
+                others.clear();
+                for (auto& m : json) {
+                    auto name = m["name"].asString().unwrapOr("?");
+                    members.push_back(name);
+                    auto client = m["client"].asString().unwrapOr("");
+                    if (client.empty() || client == m_client) continue;
+                    Member member;
+                    member.client = client;
+                    member.name = name;
+                    member.x = static_cast<float>(m["cursor_x"].asDouble().unwrapOr(0.0));
+                    member.y = static_cast<float>(m["cursor_y"].asDouble().unwrapOr(0.0));
+                    member.hasCursor = m["has_cursor"].asBool().unwrapOr(false);
+                    member.color = colorForClient(client);
+                    others.push_back(std::move(member));
+                }
             });
         });
     }
@@ -475,11 +592,44 @@ private:
 // Editor hooks: a small node that ticks the session and shows the status
 // ---------------------------------------------------------------------------
 
+// Set by the My Levels Collab button: what to do once the new level's editor opens
+enum class PendingAction { None, Host, Join };
+static PendingAction s_pendingAction = PendingAction::None;
+static std::string s_pendingCode;
+
+// Last spot touched in the editor (phones have no mouse)
+static CCPoint s_lastTouch = { 0.f, 0.f };
+static bool s_touchValid = false;
+
 class CollabTicker : public CCNode {
 public:
+    static constexpr float FLASH_TIME = 2.5f;
+    static constexpr float FEED_TIME = 12.f;
+
     WeakRef<LevelEditorLayer> m_editor;
     CCLabelBMFont* m_label = nullptr;
+    CCLabelBMFont* m_feedLabels[4] = {};
     float m_elapsed = 0.f;
+    float m_startDelay = 0.f;
+
+    // cursors and flashes live inside the editor's object layer, so they move and zoom with the level
+    Ref<CCNode> m_overlay;
+    CCDrawNode* m_flashDraw = nullptr;
+
+    struct CursorNode {
+        Ref<CCNode> node;
+        CCPoint pos;
+        CCPoint target;
+    };
+    std::unordered_map<std::string, CursorNode> m_cursors;
+
+    struct Flash {
+        std::vector<CCRect> rects;
+        ccColor3B color;
+        float life = FLASH_TIME;
+        Ref<CCLabelBMFont> tag;
+    };
+    std::vector<Flash> m_flashes;
 
     static CollabTicker* create(LevelEditorLayer* editor) {
         auto ret = new CollabTicker();
@@ -498,17 +648,58 @@ public:
         m_label->setPosition({ 8.f, winSize.height - 60.f });
         m_label->setOpacity(220);
         this->addChild(m_label);
+        for (int i = 0; i < 4; i++) {
+            auto lbl = CCLabelBMFont::create("", "chatFont.fnt");
+            lbl->setAnchorPoint({ 0.f, 1.f });
+            lbl->setScale(0.5f);
+            lbl->setPosition({ 8.f, winSize.height - 74.f - i * 12.f });
+            this->addChild(lbl);
+            m_feedLabels[i] = lbl;
+        }
+        s_touchValid = false;
         this->scheduleUpdate();
         return true;
+    }
+
+    void runPendingAction(LevelEditorLayer* editor) {
+        auto action = s_pendingAction;
+        auto code = s_pendingCode;
+        s_pendingAction = PendingAction::None;
+        s_pendingCode.clear();
+        if (action == PendingAction::Join) {
+            Notification::create(fmt::format("Joining room {}...", code), NotificationIcon::Loading, 1.f)->show();
+            CollabSession::get().join(editor, code, [](bool ok, std::string err) {
+                if (!ok) Notification::create(err, NotificationIcon::Error, 3.f)->show();
+                else Notification::create("Joined! Edits now sync live", NotificationIcon::Success)->show();
+            });
+        } else if (action == PendingAction::Host) {
+            Notification::create("Creating room...", NotificationIcon::Loading, 1.f)->show();
+            CollabSession::get().host(editor, [](bool ok, std::string err) {
+                if (!ok) Notification::create(err, NotificationIcon::Error, 3.f)->show();
+                else Notification::create(fmt::format("Room {} created! Share the code", CollabSession::get().room), NotificationIcon::Success, 3.f)->show();
+            });
+        }
     }
 
     void update(float dt) override {
         auto editor = m_editor.lock();
         if (!editor) return;
         auto& s = CollabSession::get();
+
+        if (s_pendingAction != PendingAction::None) {
+            m_startDelay += dt;
+            if (m_startDelay > 0.6f) this->runPendingAction(editor);
+        }
+
         bool mine = s.isActiveFor(editor);
         m_label->setVisible(mine);
-        if (!mine) return;
+        if (!mine) {
+            for (auto lbl : m_feedLabels) lbl->setVisible(false);
+            if (m_overlay) m_overlay->setVisible(false);
+            return;
+        }
+
+        this->updateLocalCursor(editor);
 
         m_elapsed += dt;
         float interval = static_cast<float>(Mod::get()->getSettingValue<double>("sync-interval"));
@@ -517,15 +708,186 @@ public:
             s.tick(editor);
         }
         m_label->setString(fmt::format("Collab {}  |  {} online  |  {}", s.room, std::max<size_t>(1, s.members.size()), s.status).c_str());
+
+        this->updateFeed(dt);
+        if (this->ensureOverlay(editor)) {
+            m_overlay->setVisible(true);
+            float zoom = std::max(0.05f, editor->m_objectLayer->getScale());
+            this->updateCursors(dt, zoom);
+            this->updateFlashes(dt, zoom);
+        }
+    }
+
+    void updateLocalCursor(LevelEditorLayer* editor) {
+        auto& s = CollabSession::get();
+        if (!editor->m_objectLayer) return;
+#ifdef GEODE_IS_DESKTOP
+        auto screen = getMousePos();
+#else
+        if (!s_touchValid) return;
+        auto screen = s_lastTouch;
+#endif
+        s.cursor = editor->m_objectLayer->convertToNodeSpace(screen);
+        s.hasCursor = true;
+    }
+
+    void updateFeed(float dt) {
+        auto& feed = CollabSession::get().feed;
+        for (auto& line : feed) line.age += dt;
+        while (!feed.empty() && feed.front().age > FEED_TIME) feed.pop_front();
+        for (size_t i = 0; i < 4; i++) {
+            auto lbl = m_feedLabels[i];
+            if (i >= feed.size()) {
+                lbl->setVisible(false);
+                continue;
+            }
+            // newest line on top
+            auto& line = feed[feed.size() - 1 - i];
+            lbl->setVisible(true);
+            lbl->setString(line.text.c_str());
+            lbl->setColor(line.color);
+            float left = FEED_TIME - line.age;
+            lbl->setOpacity(static_cast<GLubyte>(230.f * std::clamp(left / 2.f, 0.f, 1.f)));
+        }
+    }
+
+    bool ensureOverlay(LevelEditorLayer* editor) {
+        auto layer = editor->m_objectLayer;
+        if (!layer) return false;
+        if (!m_overlay) {
+            m_overlay = CCNode::create();
+            m_overlay->setID("collab-overlay"_spr);
+            m_flashDraw = CCDrawNode::create();
+            m_overlay->addChild(m_flashDraw);
+        }
+        if (m_overlay->getParent() != layer) {
+            m_overlay->removeFromParent();
+            layer->addChild(m_overlay, 9999);
+        }
+        return true;
+    }
+
+    static CCNode* makeCursor(std::string const& name, ccColor3B color) {
+        auto node = CCNode::create();
+        auto draw = CCDrawNode::create();
+        CCPoint arrow[] = { { 0.f, 0.f }, { 0.f, -20.f }, { 5.f, -15.f }, { 9.f, -23.f }, { 12.5f, -21.5f }, { 8.5f, -14.f }, { 15.f, -14.f } };
+        draw->drawPolygon(arrow, 7, ccc4FFromccc3B(color), 1.2f, { 0.f, 0.f, 0.f, 1.f });
+        node->addChild(draw);
+
+        auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
+        lbl->setScale(0.5f);
+        lbl->limitLabelWidth(110.f, 0.5f, 0.2f);
+        lbl->setColor(color);
+        lbl->setAnchorPoint({ 0.f, 0.5f });
+        auto size = lbl->getScaledContentSize();
+        auto bg = CCLayerColor::create({ 0, 0, 0, 170 }, size.width + 8.f, size.height + 2.f);
+        bg->setPosition({ 12.f, -30.f - size.height / 2.f - 1.f });
+        lbl->setPosition({ 16.f, -30.f });
+        node->addChild(bg);
+        node->addChild(lbl);
+        return node;
+    }
+
+    void updateCursors(float dt, float zoom) {
+        auto& s = CollabSession::get();
+        std::unordered_set<std::string> seen;
+        for (auto& m : s.others) {
+            if (!m.hasCursor) continue;
+            seen.insert(m.client);
+            CCPoint target = { m.x, m.y };
+            auto it = m_cursors.find(m.client);
+            if (it == m_cursors.end()) {
+                auto node = makeCursor(m.name, m.color);
+                node->setPosition(target);
+                m_overlay->addChild(node, 10);
+                m_cursors[m.client] = { node, target, target };
+            } else {
+                it->second.target = target;
+            }
+        }
+        for (auto it = m_cursors.begin(); it != m_cursors.end();) {
+            if (!seen.contains(it->first)) {
+                it->second.node->removeFromParent();
+                it = m_cursors.erase(it);
+                continue;
+            }
+            auto& c = it->second;
+            // glide toward the latest position so cursors don't jump once a second
+            float t = std::min(1.f, dt * 8.f);
+            c.pos = c.pos + (c.target - c.pos) * t;
+            c.node->setPosition(c.pos);
+            c.node->setScale(1.f / zoom);
+            ++it;
+        }
+    }
+
+    void updateFlashes(float dt, float zoom) {
+        auto& s = CollabSession::get();
+        for (auto& h : s.highlights) {
+            Flash f;
+            f.rects = std::move(h.rects);
+            f.color = h.color;
+            float x0 = f.rects[0].getMinX(), y1 = f.rects[0].getMaxY();
+            for (auto& r : f.rects) { x0 = std::min(x0, r.getMinX()); y1 = std::max(y1, r.getMaxY()); }
+            auto tag = CCLabelBMFont::create(h.name.c_str(), "chatFont.fnt");
+            tag->setColor(h.color);
+            tag->setAnchorPoint({ 0.f, 0.f });
+            tag->setPosition({ x0, y1 + 2.f });
+            m_overlay->addChild(tag, 5);
+            f.tag = tag;
+            m_flashes.push_back(std::move(f));
+        }
+        s.highlights.clear();
+
+        m_flashDraw->clear();
+        for (auto it = m_flashes.begin(); it != m_flashes.end();) {
+            it->life -= dt;
+            if (it->life <= 0.f) {
+                it->tag->removeFromParent();
+                it = m_flashes.erase(it);
+                continue;
+            }
+            float a = it->life / FLASH_TIME;
+            auto c = ccc4FFromccc3B(it->color);
+            ccColor4F fill = { c.r, c.g, c.b, 0.3f * a };
+            ccColor4F line = { c.r, c.g, c.b, a };
+            for (auto& r : it->rects) {
+                CCPoint box[] = {
+                    { r.getMinX(), r.getMinY() }, { r.getMaxX(), r.getMinY() },
+                    { r.getMaxX(), r.getMaxY() }, { r.getMinX(), r.getMaxY() },
+                };
+                m_flashDraw->drawPolygon(box, 4, fill, 1.5f / zoom, line);
+            }
+            it->tag->setScale(0.5f / zoom);
+            it->tag->setOpacity(static_cast<GLubyte>(255.f * a));
+            ++it;
+        }
     }
 
     void onExit() override {
         // leaving the editor (exit, save & play...) ends the session
         auto editor = m_editor.lock();
         if (editor && CollabSession::get().isActiveFor(editor)) CollabSession::get().leave();
+        if (m_overlay) m_overlay->removeFromParent();
+        m_cursors.clear();
+        m_flashes.clear();
         CCNode::onExit();
     }
 };
+
+#ifndef GEODE_IS_DESKTOP
+class $modify(CollabEditorUI, EditorUI) {
+    bool ccTouchBegan(CCTouch* touch, CCEvent* event) {
+        s_lastTouch = touch->getLocation();
+        s_touchValid = true;
+        return EditorUI::ccTouchBegan(touch, event);
+    }
+    void ccTouchMoved(CCTouch* touch, CCEvent* event) {
+        s_lastTouch = touch->getLocation();
+        EditorUI::ccTouchMoved(touch, event);
+    }
+};
+#endif
 
 class $modify(CollabEditorLayer, LevelEditorLayer) {
     bool init(GJGameLevel* level, bool noUI) {
@@ -626,8 +988,8 @@ protected:
         online->limitLabelWidth(W - 40.f, 0.55f, 0.2f);
         this->text(s.status, "chatFont.fnt", 0.5f, { W / 2, H - 128.f }, { 180, 220, 255 });
 
-        this->text("Share the code with friends. They open any level in the editor,", "chatFont.fnt", 0.45f, { W / 2, 78.f }, { 200, 200, 200 });
-        this->text("pause, press Collab and join. Everyone should save their own copy.", "chatFont.fnt", 0.45f, { W / 2, 65.f }, { 200, 200, 200 });
+        this->text("Share the code. Friends press Collab in My Levels and type it.", "chatFont.fnt", 0.45f, { W / 2, 78.f }, { 200, 200, 200 });
+        this->text("Everyone should save their own copy of the level.", "chatFont.fnt", 0.45f, { W / 2, 65.f }, { 200, 200, 200 });
 
         auto leave = this->button("Leave room", "GJ_button_06.png", 0.65f, [this] {
             CollabSession::get().leave();
@@ -719,6 +1081,133 @@ class $modify(CollabPauseLayer, EditorPauseLayer) {
         btn->setPosition({ winSize.width - 112.f, winSize.height - 52.f });
         menu->addChild(btn);
         this->addChild(menu, 100);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// My Levels: a Collab button that makes a new level and hosts / joins a room
+// ---------------------------------------------------------------------------
+
+static void openCollabLevel(PendingAction action, std::string const& code) {
+    auto level = GameLevelManager::get()->createNewLevel();
+    if (!level) {
+        Notification::create("Couldn't create a level", NotificationIcon::Error)->show();
+        return;
+    }
+    std::string name = action == PendingAction::Join ? fmt::format("Collab {}", code) : std::string("Collab Level");
+    level->m_levelName = name;
+    s_pendingAction = action;
+    s_pendingCode = code;
+    CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.5f, LevelEditorLayer::scene(level, false)));
+}
+
+class CollabStartPopup : public Popup {
+protected:
+    static constexpr float W = 320.f;
+    static constexpr float H = 220.f;
+    TextInput* m_codeInput = nullptr;
+
+    CCMenuItemSpriteExtra* button(char const* text, char const* texture, float scale, std::function<void()> fn) {
+        auto spr = ButtonSprite::create(text, "goldFont.fnt", texture, 0.8f);
+        spr->setScale(scale);
+        return CCMenuItemExt::createSpriteExtra(spr, [fn](CCMenuItemSpriteExtra*) { fn(); });
+    }
+
+    CCLabelBMFont* text(std::string const& str, float scale, CCPoint pos, ccColor3B color = { 255, 255, 255 }) {
+        auto lbl = CCLabelBMFont::create(str.c_str(), "chatFont.fnt");
+        lbl->setScale(scale);
+        lbl->setColor(color);
+        lbl->setPosition(pos);
+        m_mainLayer->addChild(lbl);
+        return lbl;
+    }
+
+    bool init() {
+        if (!Popup::init(W, H)) return false;
+        this->setTitle("Live Collab");
+        auto menu = CCMenu::create();
+        menu->setPosition({ 0.f, 0.f });
+        m_mainLayer->addChild(menu);
+
+        this->text("Join a friend's room with their code:", 0.6f, { W / 2, H - 52.f });
+        m_codeInput = TextInput::create(140.f, "CODE", "bigFont.fnt");
+        m_codeInput->setFilter("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+        m_codeInput->setMaxCharCount(8);
+        m_codeInput->setPosition({ W / 2 - 40.f, H - 85.f });
+        m_mainLayer->addChild(m_codeInput);
+        auto join = this->button("Join", "GJ_button_02.png", 0.7f, [this] { this->doJoin(); });
+        join->setPosition({ W / 2 + 85.f, H - 85.f });
+        menu->addChild(join);
+
+        this->text("or start your own:", 0.55f, { W / 2, H - 122.f }, { 200, 200, 200 });
+        auto host = this->button("New collab level", "GJ_button_01.png", 0.7f, [this] {
+            this->onClose(nullptr);
+            openCollabLevel(PendingAction::Host, "");
+        });
+        host->setPosition({ W / 2, H - 150.f });
+        menu->addChild(host);
+
+        this->text("Both make a new level in My Levels and open the editor.", 0.45f, { W / 2, 26.f }, { 200, 200, 200 });
+        return true;
+    }
+
+    void doJoin() {
+        std::string code = m_codeInput->getString();
+        for (auto& c : code) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (code.size() < 4) {
+            Notification::create("Enter the room code first", NotificationIcon::Warning)->show();
+            return;
+        }
+        this->onClose(nullptr);
+        openCollabLevel(PendingAction::Join, code);
+    }
+
+public:
+    static CollabStartPopup* create() {
+        auto ret = new CollabStartPopup();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+class $modify(CollabBrowserLayer, LevelBrowserLayer) {
+    bool init(GJSearchObject* search) {
+        if (!LevelBrowserLayer::init(search)) return false;
+        if (!search || search->m_searchType != SearchType::MyLevels) return true;
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        CCNode* icon = CCSprite::createWithSpriteFrameName("accountBtn_friends_001.png");
+        if (icon) {
+            icon->setScale(0.75f);
+        } else {
+            auto lbl = CCLabelBMFont::create("Co", "bigFont.fnt");
+            lbl->setScale(0.6f);
+            icon = lbl;
+        }
+        auto spr = CircleButtonSprite::create(icon, CircleBaseColor::Green, CircleBaseSize::Small);
+        auto btn = CCMenuItemExt::createSpriteExtra(spr, [](CCMenuItemSpriteExtra*) {
+            if (auto popup = CollabStartPopup::create()) popup->show();
+        });
+        btn->setID("collab-button"_spr);
+
+        auto lbl = CCLabelBMFont::create("Collab", "bigFont.fnt");
+        lbl->setScale(0.3f);
+
+        auto menu = CCMenu::create();
+        menu->setID("collab-menu"_spr);
+        menu->setPosition({ 0.f, 0.f });
+        // left side, above the page arrow
+        CCPoint pos = { 28.f, winSize.height / 2.f + 48.f };
+        btn->setPosition(pos);
+        lbl->setPosition(pos - CCPoint(0.f, 24.f));
+        menu->addChild(btn);
+        this->addChild(menu, 10);
+        this->addChild(lbl, 10);
+        return true;
     }
 };
 

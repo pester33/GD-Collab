@@ -83,3 +83,6 @@ $$;
 drop trigger if exists collab_touch_on_event on public.collab_events;
 create trigger collab_touch_on_event after insert on public.collab_events
   for each row execute function public.collab_touch_room();
+alter table public.collab_members add column if not exists cursor_x real not null default 0;
+alter table public.collab_members add column if not exists cursor_y real not null default 0;
+alter table public.collab_members add column if not exists has_cursor boolean not null default false;
