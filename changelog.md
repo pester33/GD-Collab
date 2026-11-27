@@ -1,3 +1,6 @@
+# v1.2.3
+- Fixed old copies of objects staying behind when someone edits them off screen (typing text left h, he, hel, hello)
+
 # v1.2.2
 - PC: your cursor now shows where you last placed or moved a block (mouse tracking didn't work on PC)
 
