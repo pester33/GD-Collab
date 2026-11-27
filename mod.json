@@ -6,7 +6,7 @@
 	},
 	"id": "pester.gd-collab",
 	"name": "GD Gaming Collab",
-	"version": "v1.2.3",
+	"version": "v1.2.4",
 	"developer": "Pester",
 	"description": "Build levels together live: host a room in the editor, friends join with the code, and everyone's edits sync.",
 	"tags": [
